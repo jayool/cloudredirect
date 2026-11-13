@@ -1,0 +1,6 @@
+/home/user/cloudredirect/build64/CMakeFiles/cloud_redirect.dir
+/home/user/cloudredirect/build64/CMakeFiles/cloud_redirect_cli.dir
+/home/user/cloudredirect/build64/CMakeFiles/pending_ops_journal_tests.dir
+/home/user/cloudredirect/build64/CMakeFiles/test.dir
+/home/user/cloudredirect/build64/CMakeFiles/edit_cache.dir
+/home/user/cloudredirect/build64/CMakeFiles/rebuild_cache.dir

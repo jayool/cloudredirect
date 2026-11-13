@@ -575,6 +575,20 @@ static void* DeferredInitThread(void*)
         if (SteamclientMapped()) break;
         usleep(500000);
     }
+#if defined(__x86_64__)
+    if (!SteamclientMapped()) {
+        // Launcher-stage process (see OnLoad): no steamclient.so here, the client
+        // is a child that inherits LD_PRELOAD. Stay passive, no error, no notify.
+        DebugLog("[CR] DeferredInit: no steamclient.so in this process, launcher stage; staying passive\n");
+        Log::Info("steamclient.so not mapped in this process (pid=%d): launcher stage, staying passive", getpid());
+        g_initThreadDone.store(true, std::memory_order_release);
+        return nullptr;
+    }
+    // This is the client: drop ourselves from LD_PRELOAD now, so its children
+    // (steamwebhelper, games) do not inherit the .so -- what the 32-bit build
+    // does at load time.
+    CleanLdPreload();
+#endif
     DebugLog("[CR] DeferredInit: starting\n");
 
     // Install crash guard so a bad memory read aborts correctly
@@ -616,8 +630,18 @@ static void OnLoad()
     if (proc != "steam" && !SteamclientMapped())
         return;
 
-    // Clean ourselves from LD_PRELOAD so child processes don't inherit us
+#if !defined(__x86_64__)
+    // Clean ourselves from LD_PRELOAD so child processes don't inherit us.
+    // (32-bit client: this process is the client itself.)
     CleanLdPreload();
+#else
+    // 64-bit client: the launcher chain (steamrt64/steam updater stage,
+    // pressure-vessel) is all named "steam" too, and the real client runs as a
+    // child inside the runtime container. Stripping LD_PRELOAD here would stop
+    // that child from inheriting us (run 103: loaded in the launcher, never in
+    // the client). The strip moves to DeferredInitThread, once steamclient.so
+    // is mapped, i.e. in the client, before its own children start.
+#endif
 
     EnsureLogInit();
     DebugLog("[CR] OnLoad: target process (steam), spawning deferred init thread\n");
