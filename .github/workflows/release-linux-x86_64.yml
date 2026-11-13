@@ -1,0 +1,120 @@
+name: Release Linux x86_64
+
+# On a version tag, build cloud_redirect.so and cloud_redirect_cli for the 64-bit
+# Steam client (steamrt64) and attach them to the GitHub release of that tag.
+#
+# Recipe (the one validated by jayool/luma-lab's login smoke, runs 103-104, and
+# on a Steam Deck): compiled in an Ubuntu 22.04 container with GCC 12 (the
+# project needs GCC >= 12; 22.04 gives glibc 2.35 / GLIBCXX_3.4.30, the same
+# libstdc++ reach as the 32-bit build), OpenSSL and curl built from source and
+# linked statically into the .so with their symbols hidden, so the result depends
+# only on libstdc++/libgcc/libc.
+#
+# Assets: cloud_redirect-x86_64.so, cloud_redirect_cli-x86_64 and SHA256SUMS.
+# The installer (lumalinux's setup.sh) pins the .so by its sha256.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and attach the assets to"
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  OPENSSL_VER: 3.0.15
+  CURL_VER: 8.11.1
+  BUILD_IMAGE: ubuntu:22.04
+
+jobs:
+  build:
+    name: cloud_redirect x86_64 @ ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Restore deps/install64 (static OpenSSL + curl)
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: deps/install64
+          key: cr-deps64-${{ env.BUILD_IMAGE }}-openssl${{ env.OPENSSL_VER }}-curl${{ env.CURL_VER }}-v2
+
+      - name: Build in ${{ env.BUILD_IMAGE }} with GCC 12
+        env:
+          DEPS_CACHED: ${{ steps.deps.outputs.cache-hit }}
+        run: |
+          sha="$(git rev-parse --short=7 HEAD)"
+          echo "commit: $(git rev-parse HEAD) tag: ${{ inputs.tag || github.ref_name }}"
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src \
+            -e OPENSSL_VER -e CURL_VER -e DEPS_CACHED -e CR_SHA="$sha" "$BUILD_IMAGE" bash -ec '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get -qq update >/dev/null
+            apt-get -y -qq install gcc-12 g++-12 cmake ninja-build make perl curl ca-certificates file binutils >/dev/null
+            export CC=gcc-12 CXX=g++-12
+            echo "$(g++-12 --version | head -n 1); cmake $(cmake --version | head -n 1 | cut -d" " -f3); glibc $(ldd --version | head -n 1 | awk "{print \$NF}")"
+            DEPS="$PWD/deps/install64"
+            if [ "$DEPS_CACHED" != "true" ] || [ ! -s "$DEPS/lib/libcurl.a" ]; then
+              echo "== building static OpenSSL $OPENSSL_VER + curl $CURL_VER"
+              rm -rf deps/src; mkdir -p deps/src "$DEPS"; cd deps/src
+              curl -fsSL -o openssl.tar.gz "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VER/openssl-$OPENSSL_VER.tar.gz"
+              curl -fsSL -o curl.tar.gz "https://github.com/curl/curl/releases/download/curl-${CURL_VER//./_}/curl-$CURL_VER.tar.gz"
+              tar xzf openssl.tar.gz && tar xzf curl.tar.gz
+              ( cd "openssl-$OPENSSL_VER" \
+                && ./Configure linux-x86_64 no-shared no-dso no-tests no-engine -fPIC --prefix="$DEPS" --libdir=lib >/dev/null \
+                && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install_sw >/dev/null 2>&1 )
+              ( cd "curl-$CURL_VER" \
+                && ./configure --prefix="$DEPS" --disable-shared --enable-static --with-openssl="$DEPS" \
+                     --without-libpsl --without-zlib --without-brotli --without-zstd --without-libidn2 --without-nghttp2 \
+                     --without-librtmp --without-libssh2 --disable-ldap --disable-ldaps --disable-rtsp --disable-ftp \
+                     --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp \
+                     --disable-gopher --disable-mqtt --disable-manual --disable-docs \
+                     --without-ca-bundle --with-ca-path=/etc/ssl/certs --with-ca-fallback CFLAGS=-fPIC >/dev/null \
+                && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 )
+              cd /src && rm -rf deps/src
+            else
+              echo "== deps/install64 from cache"
+            fi
+            echo "== cloud_redirect x86_64 (CR_GIT_SHA=$CR_SHA)"
+            rm -rf build64 && mkdir build64 && cd build64
+            cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DLINUX_X86_64=ON -DDEPS64_PREFIX="$DEPS" -DCR_GIT_SHA="$CR_SHA" 2>&1 | grep -E "x86_64 build|Error|error" || true
+            ninja cloud_redirect cloud_redirect_cli 2>&1 | grep -v -E "^\[[0-9]+/[0-9]+\] " | tail -n 20
+            file cloud_redirect.so cloud_redirect_cli | sed "s/, BuildID.*//"
+            echo "NEEDED:"; readelf -d cloud_redirect.so | grep NEEDED | sed "s/^ */  /"
+            echo "max GLIBC: $(strings cloud_redirect.so | grep -oE "GLIBC_2\.[0-9]+" | sort -t. -k2 -n -u | tail -n 1)  max GLIBCXX: $(strings cloud_redirect.so | grep -oE "GLIBCXX_3\.4\.[0-9]+" | sort -t. -k3 -n -u | tail -n 1)"
+            if readelf -d cloud_redirect.so | grep -qE "libcurl|libssl|libcrypto"; then echo "::error::cloud_redirect.so links curl/OpenSSL dynamically (expected static, hidden)"; exit 1; fi
+            cls="$(od -An -tu1 -j4 -N1 cloud_redirect.so | tr -d " ")"
+            [ "$cls" = "2" ] || { echo "::error::cloud_redirect.so is not a 64-bit ELF (class $cls)"; exit 1; }'
+          sudo chown -R "$(id -u):$(id -g)" .
+
+      - name: Stage the assets
+        run: |
+          mkdir -p out
+          cp build64/cloud_redirect.so out/cloud_redirect-x86_64.so && chmod 644 out/cloud_redirect-x86_64.so
+          cp build64/cloud_redirect_cli out/cloud_redirect_cli-x86_64 && chmod 755 out/cloud_redirect_cli-x86_64
+          ( cd out && sha256sum cloud_redirect-x86_64.so cloud_redirect_cli-x86_64 > SHA256SUMS && cat SHA256SUMS )
+
+      # The release is created if the tag has none yet; the body is the compare
+      # link only. Assets are replaced when the workflow is re-run on a tag.
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          prev="$(git tag --list 'v*' | sort -V | grep -B1 -x "$TAG" | head -n 1)"
+          if [ -n "$prev" ] && [ "$prev" != "$TAG" ]; then
+            notes="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${prev}...${TAG}"
+          else
+            notes="**Full Changelog**: https://github.com/${{ github.repository }}/commits/${TAG}"
+          fi
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "$notes"
+          gh release upload "$TAG" --clobber out/cloud_redirect-x86_64.so out/cloud_redirect_cli-x86_64 out/SHA256SUMS
+          gh release view "$TAG" --json assets --jq '.assets[] | "  \(.name) \(.size) bytes"'

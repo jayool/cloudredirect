@@ -465,6 +465,38 @@ static void ManualBacktrace(void* ctx)
             if (w >= lo && w < hi) { WriteFrame(w); ++printed; }
         }
     }
+#elif defined(__x86_64__)
+    ucontext_t* uc = static_cast<ucontext_t*>(ctx);
+    uintptr_t ip  = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    uintptr_t rbp = (uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+    uintptr_t rsp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+    WriteFrame(ip); // frame 0 = faulting instruction
+
+    // Pass 1: RBP chain (works when frame pointers are present).
+    const char* h1 = "[CR]  -- rbp chain --\n";
+    if (g_debugFd >= 0) write(g_debugFd, h1, strlen(h1));
+    uintptr_t prev = 0, bp = rbp;
+    for (int depth = 0; depth < 32; ++depth) {
+        if (bp < 0x1000 || (bp & 7) || bp <= prev) break;
+        uintptr_t* fp = (uintptr_t*)bp;
+        uintptr_t ret = fp[1];
+        if (ret < 0x1000) break;
+        WriteFrame(ret);
+        prev = bp; bp = fp[0];
+    }
+
+    // Pass 2: stack scan for return addresses into steamclient.so .text.
+    uintptr_t lo, hi;
+    if (SteamclientExecRange(lo, hi)) {
+        const char* h2 = "[CR]  -- stack scan (steamclient .text return addrs) --\n";
+        if (g_debugFd >= 0) write(g_debugFd, h2, strlen(h2));
+        uintptr_t scanEnd = rsp + 0x4000; // 16KB window up the stack
+        int printed = 0;
+        for (uintptr_t s = rsp & ~(uintptr_t)7; s < scanEnd && printed < 48; s += 8) {
+            uintptr_t w = *(uintptr_t*)s;
+            if (w >= lo && w < hi) { WriteFrame(w); ++printed; }
+        }
+    }
 #else
     (void)ctx;
 #endif
@@ -543,6 +575,20 @@ static void* DeferredInitThread(void*)
         if (SteamclientMapped()) break;
         usleep(500000);
     }
+#if defined(__x86_64__)
+    if (!SteamclientMapped()) {
+        // Launcher-stage process (see OnLoad): no steamclient.so here, the client
+        // is a child that inherits LD_PRELOAD. Stay passive, no error, no notify.
+        DebugLog("[CR] DeferredInit: no steamclient.so in this process, launcher stage; staying passive\n");
+        Log::Info("steamclient.so not mapped in this process (pid=%d): launcher stage, staying passive", getpid());
+        g_initThreadDone.store(true, std::memory_order_release);
+        return nullptr;
+    }
+    // This is the client: drop ourselves from LD_PRELOAD now, so its children
+    // (steamwebhelper, games) do not inherit the .so -- what the 32-bit build
+    // does at load time.
+    CleanLdPreload();
+#endif
     DebugLog("[CR] DeferredInit: starting\n");
 
     // Install crash guard so a bad memory read aborts correctly
@@ -584,8 +630,18 @@ static void OnLoad()
     if (proc != "steam" && !SteamclientMapped())
         return;
 
-    // Clean ourselves from LD_PRELOAD so child processes don't inherit us
+#if !defined(__x86_64__)
+    // Clean ourselves from LD_PRELOAD so child processes don't inherit us.
+    // (32-bit client: this process is the client itself.)
     CleanLdPreload();
+#else
+    // 64-bit client: the launcher chain (steamrt64/steam updater stage,
+    // pressure-vessel) is all named "steam" too, and the real client runs as a
+    // child inside the runtime container. Stripping LD_PRELOAD here would stop
+    // that child from inheriting us (run 103: loaded in the launcher, never in
+    // the client). The strip moves to DeferredInitThread, once steamclient.so
+    // is mapped, i.e. in the client, before its own children start.
+#endif
 
     EnsureLogInit();
     DebugLog("[CR] OnLoad: target process (steam), spawning deferred init thread\n");

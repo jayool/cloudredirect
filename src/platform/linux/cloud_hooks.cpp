@@ -146,6 +146,7 @@ private:
 //   Then at +0x1d: test edx,edx      => 85 d2
 //   Then at +0x1f: jns short          => 79 xx
 
+#if defined(__i386__)
 static const uint8_t kSerializeSig[] = {
     0x55, 0x89, 0xE5, 0x53, 0x83, 0xEC, 0x10,
     0x8B, 0x5D, 0x08, 0x8B, 0x03, 0x53, 0xFF, 0x50, 0x28
@@ -161,6 +162,35 @@ static const uint8_t kParsePrologue[] = {
 static const uint8_t kParseArgLoads[] = {
     0x8B, 0x45, 0x08, 0x8B, 0x55, 0x10, 0x8B, 0x75, 0x0C, 0x85, 0xD2, 0x79
 };
+#elif defined(__x86_64__)
+// 64-bit steamrt64 client. Same helpers, SysV code shapes.
+//
+// SerializeToArray(msg, buf): rdi=msg, rsi=buf. Reads vtable, calls
+// ByteSizeLong via [rax+0x50] (slot 10), tail-calls the raw writer:
+//   48 83 ec 18          sub  rsp,0x18
+//   48 8b 07             mov  rax,[rdi]        ; vtable
+//   48 89 74 24 08       mov  [rsp+8],rsi
+//   48 89 3c 24          mov  [rsp],rdi
+//   ff 50 50             call [rax+0x50]       ; ByteSizeLong
+static const uint8_t kSerializeSig[] = {
+    0x48, 0x83, 0xEC, 0x18, 0x48, 0x8B, 0x07, 0x48, 0x89, 0x74,
+    0x24, 0x08, 0x48, 0x89, 0x3C, 0x24, 0xFF, 0x50, 0x50, 0x48
+};
+
+// ParseFromArray(msg, data, len): rdi=msg, rsi=data, edx=len. Two near-identical
+// twins exist (GetUserStats parse variants); the merge-flag=1 twin is the one
+// the 32-bit code also selected. Match the prologue and pin the twin by its
+// mov ecx,1 at +0x41 so selection is deterministic (not address-order).
+//   41 55 41 54 55       push r13; push r12; push rbp
+//   48 63 ea             movslq edx,rbp        ; len
+//   48 85 ed             test rbp,rbp
+//   79 1f                jns  +0x1f
+static const uint8_t kParsePrologue[] = {
+    0x41, 0x55, 0x41, 0x54, 0x55, 0x48, 0x63, 0xEA, 0x48, 0x85, 0xED, 0x79, 0x1F
+};
+static const uint8_t kParseFlagByte = 0xB9;      // mov ecx, imm32
+static constexpr size_t kParseFlagOff = 0x41;    // offset of the mov ecx,1
+#endif
 
 static void* ScanForPattern(void* base, size_t size, const uint8_t* pattern, size_t patLen) {
     const uint8_t* p = (const uint8_t*)base;
@@ -187,16 +217,26 @@ bool CloudHooks::ResolveProtobufHelpers(void* steamclientBase, size_t steamclien
         return false;
     }
     const uint8_t* p = (const uint8_t*)steamclientBase;
-    const uint8_t* end = p + steamclientSize - 0x30;
+    const uint8_t* end = p + steamclientSize - 0x60;
     void* parseFound = nullptr;
     for (; p <= end; ++p) {
         if (memcmp(p, kParsePrologue, sizeof(kParsePrologue)) != 0) continue;
+#if defined(__i386__)
         // Check arg loads at offset +0x14 (after PIC thunk: e8 + 4 + add ebx + 4 = 11 bytes after prologue)
         // Prologue is 9 bytes, PIC fixup is 11 bytes => offset 20 = 0x14
         if (memcmp(p + 0x14, kParseArgLoads, sizeof(kParseArgLoads)) == 0) {
             parseFound = (void*)p;
             break;
         }
+#elif defined(__x86_64__)
+        // Pin the merge-flag=1 twin: mov ecx,1 (B9 01 00 00 00) at +0x41.
+        if (p[kParseFlagOff] == kParseFlagByte && p[kParseFlagOff + 1] == 0x01 &&
+            p[kParseFlagOff + 2] == 0x00 && p[kParseFlagOff + 3] == 0x00 &&
+            p[kParseFlagOff + 4] == 0x00) {
+            parseFound = (void*)p;
+            break;
+        }
+#endif
     }
     if (parseFound) {
         g_parseFromArray = (ParseFromArray_t)parseFound;
@@ -211,10 +251,11 @@ bool CloudHooks::ResolveProtobufHelpers(void* steamclientBase, size_t steamclien
 static std::vector<uint8_t> SerializeMessage(void* msg) {
     if (!msg || !g_serializeToArray) return {};
 
-    // vtable[9] = ByteSizeLong (offset +36 on 32-bit)
-    uint32_t* vtable = *(uint32_t**)msg;
+    // vtable[9] = ByteSizeLong (slot 9: +36 on 32-bit, +72 on 64-bit).
+    // Index by void** so the slot width tracks the pointer size.
+    void** vtable = *(void***)msg;
     if (!vtable || !vtable[9]) return {};
-    using ByteSizeFn = int(__attribute__((cdecl)) *)(void*);
+    using ByteSizeFn = int(*)(void*);
     ProtoCrashGuard guard;
     int sig = sigsetjmp(g_protoJmpBuf, 1);
     if (sig != 0) {
@@ -887,23 +928,26 @@ extern "C" int hook_SyncSend2(void* pThis, const char* methodName, void* buf, un
     return 1;
 }
 
-// Hook: IsCloudEnabledForApp (CUserRemoteStorage vtable slot 24)
-// 32-bit cdecl: bool(void* this, unsigned int appId)
-// Returns true for namespace apps so cloud toggle stays enabled.
-
-using IsCloudEnabledForApp_t = bool(*)(void* pThis, unsigned int appId);
+// Hook: IsCloudEnabledForApp (CUserRemoteStorage, slot resolved at runtime by
+// prologue; slot 8 on current builds). Returns true for namespace apps so the
+// cloud toggle stays enabled.
+//
+// The real method takes four args (this, appId, a3, a4). The hook only reads
+// the first two, but must forward all four verbatim: on 32-bit cdecl they are
+// re-pushed, and on 64-bit SysV a3/a4 arrive in rdx/rcx and are passed through.
+using IsCloudEnabledForApp_t = bool(*)(void* pThis, unsigned int appId, void* a3, void* a4);
 static std::atomic<IsCloudEnabledForApp_t> g_origIsCloudEnabledForApp{nullptr};
 
 void CloudHooks::SetOriginalIsCloudEnabled(void* orig) {
     g_origIsCloudEnabledForApp.store(reinterpret_cast<IsCloudEnabledForApp_t>(orig), std::memory_order_release);
 }
 
-extern "C" bool hook_IsCloudEnabledForApp(void* pThis, unsigned int appId)
+extern "C" bool hook_IsCloudEnabledForApp(void* pThis, unsigned int appId, void* a3, void* a4)
 {
     HookGuard guard;
     if (g_shuttingDown.load(std::memory_order_acquire)) {
         auto fn = g_origIsCloudEnabledForApp.load(std::memory_order_acquire);
-        return fn ? fn(pThis, appId) : true;
+        return fn ? fn(pThis, appId, a3, a4) : true;
     }
     CrashContextScope crashContext("IsCloudEnabledForApp:entry", "IsCloudEnabledForApp", appId);
     if (CloudIntercept::IsNamespaceApp(appId)) {
@@ -913,7 +957,7 @@ extern "C" bool hook_IsCloudEnabledForApp(void* pThis, unsigned int appId)
 
     auto origFn = g_origIsCloudEnabledForApp.load(std::memory_order_acquire);
     if (origFn) {
-        return origFn(pThis, appId);
+        return origFn(pThis, appId, a3, a4);
     }
     return true;
 }

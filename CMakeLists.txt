@@ -206,6 +206,33 @@ else()
         target_include_directories(cloud_redirect SYSTEM BEFORE PRIVATE
             /usr/include/c++/${GCC_MAJOR}/i686-redhat-linux
         )
+    elseif(LINUX_X86_64)
+        # Native 64-bit build for Steam's 64-bit client (steamrt64). No -m32.
+        # With a DEPS64 prefix holding static curl/OpenSSL, link them in and hide
+        # their symbols (same shape as the 32-bit DEPS32 path). Without one, link
+        # the build environment's libcurl dynamically: the .so is built inside the
+        # Steam Runtime SDK, and the client runs inside that same runtime, which
+        # ships libcurl.so.4.
+        if(NOT DEFINED DEPS64_PREFIX)
+            set(DEPS64_PREFIX "${CMAKE_SOURCE_DIR}/deps/install64")
+        endif()
+        set(DEPS64 "${DEPS64_PREFIX}")
+        if(EXISTS "${DEPS64}/lib/libcurl.a")
+            set(CR_CURL_STATIC_64 ON)
+            target_include_directories(cloud_redirect PRIVATE "${DEPS64}/include")
+            target_link_libraries(cloud_redirect PRIVATE
+                "${DEPS64}/lib/libcurl.a"
+                "${DEPS64}/lib/libssl.a"
+                "${DEPS64}/lib/libcrypto.a"
+            )
+            target_link_options(cloud_redirect PRIVATE -Wl,--exclude-libs,ALL)
+        else()
+            set(CR_CURL_STATIC_64 OFF)
+            find_package(CURL REQUIRED)
+            target_link_libraries(cloud_redirect PRIVATE CURL::libcurl)
+        endif()
+        message(STATUS "x86_64 build: static curl/OpenSSL = ${CR_CURL_STATIC_64}")
+        target_link_libraries(cloud_redirect PRIVATE atomic)
     elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
         # Cross-compiling 32-bit on 64-bit: find the multilib atomic
         find_library(LIBATOMIC_32 NAMES atomic
@@ -228,7 +255,7 @@ else()
         target_link_options(cloud_redirect PRIVATE -s)
     endif()
 
-    # CLI wrapper (32-bit loader for cloud_redirect.so)
+    # CLI wrapper (loads cloud_redirect.so; must match the .so's word size)
     add_executable(cloud_redirect_cli
         src/platform/linux/cli_main.cpp
     )
@@ -396,6 +423,15 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
                 "${DEPS32}/lib/libssl.a"
                 "${DEPS32}/lib/libcrypto.a"
             )
+        elseif(LINUX_X86_64 AND CR_CURL_STATIC_64)
+            target_include_directories(cloud_storage_staging_tests PRIVATE "${DEPS64}/include")
+            target_link_libraries(cloud_storage_staging_tests PRIVATE
+                "${DEPS64}/lib/libcurl.a"
+                "${DEPS64}/lib/libssl.a"
+                "${DEPS64}/lib/libcrypto.a"
+            )
+        elseif(LINUX_X86_64)
+            target_link_libraries(cloud_storage_staging_tests PRIVATE CURL::libcurl)
         endif()
     endif()
     add_test(NAME cloud_storage_staging_tests COMMAND cloud_storage_staging_tests)
