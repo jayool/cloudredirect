@@ -206,6 +206,22 @@ else()
         target_include_directories(cloud_redirect SYSTEM BEFORE PRIVATE
             /usr/include/c++/${GCC_MAJOR}/i686-redhat-linux
         )
+    elseif(LINUX_X86_64)
+        # Native 64-bit build for Steam's 64-bit client (steamrt64). No -m32.
+        # Static curl/OpenSSL from DEPS64, symbols hidden so steamclient can't
+        # interpose them -- same shape as the 32-bit DEPS32 path.
+        if(NOT DEFINED DEPS64_PREFIX)
+            set(DEPS64_PREFIX "${CMAKE_SOURCE_DIR}/deps/install64")
+        endif()
+        set(DEPS64 "${DEPS64_PREFIX}")
+        target_include_directories(cloud_redirect PRIVATE "${DEPS64}/include")
+        target_link_libraries(cloud_redirect PRIVATE
+            "${DEPS64}/lib/libcurl.a"
+            "${DEPS64}/lib/libssl.a"
+            "${DEPS64}/lib/libcrypto.a"
+        )
+        target_link_options(cloud_redirect PRIVATE -Wl,--exclude-libs,ALL)
+        target_link_libraries(cloud_redirect PRIVATE atomic)
     elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
         # Cross-compiling 32-bit on 64-bit: find the multilib atomic
         find_library(LIBATOMIC_32 NAMES atomic
@@ -228,7 +244,7 @@ else()
         target_link_options(cloud_redirect PRIVATE -s)
     endif()
 
-    # CLI wrapper (32-bit loader for cloud_redirect.so)
+    # CLI wrapper (loads cloud_redirect.so; must match the .so's word size)
     add_executable(cloud_redirect_cli
         src/platform/linux/cli_main.cpp
     )
@@ -395,6 +411,13 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
                 "${DEPS32}/lib/libcurl.a"
                 "${DEPS32}/lib/libssl.a"
                 "${DEPS32}/lib/libcrypto.a"
+            )
+        elseif(LINUX_X86_64)
+            target_include_directories(cloud_storage_staging_tests PRIVATE "${DEPS64}/include")
+            target_link_libraries(cloud_storage_staging_tests PRIVATE
+                "${DEPS64}/lib/libcurl.a"
+                "${DEPS64}/lib/libssl.a"
+                "${DEPS64}/lib/libcrypto.a"
             )
         endif()
     endif()

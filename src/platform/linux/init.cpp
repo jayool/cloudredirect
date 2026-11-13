@@ -465,6 +465,38 @@ static void ManualBacktrace(void* ctx)
             if (w >= lo && w < hi) { WriteFrame(w); ++printed; }
         }
     }
+#elif defined(__x86_64__)
+    ucontext_t* uc = static_cast<ucontext_t*>(ctx);
+    uintptr_t ip  = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    uintptr_t rbp = (uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+    uintptr_t rsp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+    WriteFrame(ip); // frame 0 = faulting instruction
+
+    // Pass 1: RBP chain (works when frame pointers are present).
+    const char* h1 = "[CR]  -- rbp chain --\n";
+    if (g_debugFd >= 0) write(g_debugFd, h1, strlen(h1));
+    uintptr_t prev = 0, bp = rbp;
+    for (int depth = 0; depth < 32; ++depth) {
+        if (bp < 0x1000 || (bp & 7) || bp <= prev) break;
+        uintptr_t* fp = (uintptr_t*)bp;
+        uintptr_t ret = fp[1];
+        if (ret < 0x1000) break;
+        WriteFrame(ret);
+        prev = bp; bp = fp[0];
+    }
+
+    // Pass 2: stack scan for return addresses into steamclient.so .text.
+    uintptr_t lo, hi;
+    if (SteamclientExecRange(lo, hi)) {
+        const char* h2 = "[CR]  -- stack scan (steamclient .text return addrs) --\n";
+        if (g_debugFd >= 0) write(g_debugFd, h2, strlen(h2));
+        uintptr_t scanEnd = rsp + 0x4000; // 16KB window up the stack
+        int printed = 0;
+        for (uintptr_t s = rsp & ~(uintptr_t)7; s < scanEnd && printed < 48; s += 8) {
+            uintptr_t w = *(uintptr_t*)s;
+            if (w >= lo && w < hi) { WriteFrame(w); ++printed; }
+        }
+    }
 #else
     (void)ctx;
 #endif

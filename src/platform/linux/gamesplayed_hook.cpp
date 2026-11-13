@@ -11,10 +11,17 @@
 
 namespace GamesPlayedHook {
 
-// CProtoBufMsg 32-bit layout (reversed from ctor): EMsg at +20 (high bit is the
-// send flag, mask it off), body protobuf object pointer at +32.
+// CProtoBufMsg layout (reversed from the ctor): EMsg (high bit = send flag,
+// masked off) then the body protobuf object pointer.
+//   32-bit: EMsg at +20, body at +32.
+//   64-bit: EMsg at +0x28, body at +0x38 (a conn-target ptr sits at +0x30).
+#if defined(__x86_64__)
+static constexpr size_t OFF_EMSG = 0x28;
+static constexpr size_t OFF_BODY = 0x38;
+#else
 static constexpr size_t OFF_EMSG = 20;
 static constexpr size_t OFF_BODY = 32;
+#endif
 static constexpr uint32_t EMSG_MASK = 0x7FFFFFFF;
 
 // CMsgClientGamesPlayed EMsg variants.
@@ -41,6 +48,35 @@ static uint8_t  g_savedBytes[16];          // original bytes at the hook point
 static size_t   g_savedLen = 0;
 static uint8_t* g_trampoline = nullptr;    // executable: stolen bytes + jmp back
 
+#if defined(__x86_64__)
+// steamrt64 CCMInterface::Send(this=rdi, msg=rsi). Detour at the entry; the
+// trampoline saves the arg/caller-saved registers, calls the observer with
+// (rdi, rsi), restores, runs the stolen prologue and jumps back.
+//   53                push rbx
+//   48 89 fb          mov  rbx, rdi
+//   48 83 ec 10       sub  rsp, 0x10
+//   8b 87 04 06 00 00 mov  eax, [rdi+0x604]
+//   85 c0             test eax, eax
+//   0f 84 ?? ?? ?? ?? jz   near            (target wildcarded)
+static constexpr size_t PROLOGUE_LEN = 0;   // detour at entry
+// Steal 14 bytes (push rbx; mov rbx,rdi; sub rsp,0x10; mov eax,[rdi+0x604]) so
+// the patch is a full 64-bit absolute jump (ff 25 + imm64 = 14 bytes), which
+// reaches the trampoline no matter where mmap places it.
+static constexpr size_t STOLEN_LEN   = 14;
+static constexpr size_t RESUME_OFF   = STOLEN_LEN;
+static const uint8_t  kSigBytes[] = {
+    0x53, 0x48,0x89,0xFB, 0x48,0x83,0xEC,0x10,
+    0x8B,0x87,0x04,0x06,0x00,0x00, 0x85,0xC0, 0x0F,0x84, 0,0,0,0
+};
+static const uint8_t  kSigMask[] = {
+    1, 1,1,1, 1,1,1,1,
+    1,1,1,1,1,1, 1,1, 1,1, 0,0,0,0
+};
+static constexpr size_t kSigLen = sizeof(kSigBytes);
+
+// Hook: runs on Steam's network thread. Pure observer -- never blocks sends.
+extern "C" int GamesPlayedHook_OnSend(void* cmInterface, void* msg) {
+#else
 // The PIC prologue (push ebp/edi/esi/ebx; call get_pc_thunk; add ebx, delta) is
 // position-locked, so we detour AFTER it. At the hook point ebx already holds
 // the GOT base and the 4 register pushes are done.
@@ -76,6 +112,7 @@ static constexpr size_t kSigLen = sizeof(kSigBytes);
 
 // Hook: runs on Steam's network thread. Pure observer -- never blocks sends.
 extern "C" int GamesPlayedHook_OnSend(int cmInterface, void* msg) {
+#endif
     (void)cmInterface;
     g_inFlight.fetch_add(1, std::memory_order_acquire);
     if (!g_shuttingDown.load(std::memory_order_acquire) && msg && g_serializeBody) {
@@ -149,6 +186,60 @@ extern "C" int GamesPlayedHook_OnSend(int cmInterface, void* msg) {
 //   pop  edi                          ; 5F
 //   pop  ebp                          ; 5D
 //   ret                               ; C3
+#if defined(__x86_64__)
+// 64-bit trampoline. Detour at entry: save the arg + caller-saved registers,
+// call the observer with (rdi=this, rsi=msg), restore, run the stolen prologue,
+// jump back. OnSend is a pure observer (always returns 0), so there is no block
+// path. Nine 8-byte pushes keep rsp 16-aligned at the call.
+//   57            push rdi            ; preserve this (also arg1)
+//   56            push rsi            ; preserve msg  (also arg2)
+//   50 51 52      push rax/rcx/rdx
+//   41 50..53     push r8/r9/r10/r11
+//   48 B8 <imm64> movabs rax, OnSend
+//   FF D0         call  rax
+//   41 5B..58     pop r11/r10/r9/r8
+//   5A 59 58      pop rdx/rcx/rax
+//   5E 5F         pop rsi/rdi
+//   <stolen 14>   push rbx; mov rbx,rdi; sub rsp,0x10; mov eax,[rdi+0x604]
+//   FF 25 <rip+0> jmp  qword [rip+0]      ; register-free: keeps eax from stolen
+//   <imm64>       .quad funcStart+STOLEN_LEN
+static bool BuildTrampoline(uint8_t* hookPoint) {
+    long pageSize = sysconf(_SC_PAGESIZE);
+    g_trampoline = (uint8_t*)mmap(nullptr, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_trampoline == MAP_FAILED) {
+        g_trampoline = nullptr;
+        LOG("[GamesPlayed] mmap trampoline failed");
+        return false;
+    }
+
+    uint8_t* p = g_trampoline;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) {
+        for (uint8_t b : bytes) *p++ = b;
+    };
+    auto emit64 = [&](uint64_t v) {
+        for (int i = 0; i < 8; ++i) { *p++ = v & 0xFF; v >>= 8; }
+    };
+
+    emit({0x57});                         // push rdi (this)
+    emit({0x56});                         // push rsi (msg)
+    emit({0x50, 0x51, 0x52});             // push rax, rcx, rdx
+    emit({0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53}); // push r8, r9, r10, r11
+    emit({0x48, 0xB8}); emit64((uint64_t)(uintptr_t)&GamesPlayedHook_OnSend); // movabs rax, OnSend
+    emit({0xFF, 0xD0});                   // call rax
+    emit({0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58}); // pop r11, r10, r9, r8
+    emit({0x5A, 0x59, 0x58});             // pop rdx, rcx, rax
+    emit({0x5E, 0x5F});                   // pop rsi, rdi
+
+    memcpy(p, hookPoint, STOLEN_LEN);     // stolen prologue
+    p += STOLEN_LEN;
+
+    uintptr_t resume = (uintptr_t)hookPoint + RESUME_OFF;
+    emit({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00}); // jmp qword [rip+0]
+    emit64((uint64_t)resume);                   // .quad resume (no register touched)
+    return true;
+}
+#else
 static bool BuildTrampoline(uint8_t* hookPoint) {
     long pageSize = sysconf(_SC_PAGESIZE);
     g_trampoline = (uint8_t*)mmap(nullptr, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -201,6 +292,7 @@ static bool BuildTrampoline(uint8_t* hookPoint) {
     emit({0xC3});                         // ret
     return true;
 }
+#endif
 
 static bool FindBySignature(uintptr_t base, size_t size, uint8_t*& outFuncStart) {
     if (size < kSigLen) return false;
@@ -257,11 +349,20 @@ bool Install(uintptr_t steamclientBase, size_t steamclientSize) {
         return false;
     }
 
+#if defined(__x86_64__)
+    // Absolute indirect jmp: ff 25 <rip+0> then the 8-byte trampoline address.
+    // 14 bytes exactly (== STOLEN_LEN); reaches anywhere in the address space.
+    uint64_t dst = (uint64_t)(uintptr_t)g_trampoline;
+    g_hookPoint[0] = 0xFF; g_hookPoint[1] = 0x25;
+    g_hookPoint[2] = 0x00; g_hookPoint[3] = 0x00; g_hookPoint[4] = 0x00; g_hookPoint[5] = 0x00;
+    memcpy(g_hookPoint + 6, &dst, 8);
+#else
     // E9 rel32 jmp to the trampoline; pad remaining stolen bytes with NOP.
     int32_t rel = (int32_t)((uintptr_t)g_trampoline - ((uintptr_t)g_hookPoint + 5));
     g_hookPoint[0] = 0xE9;
     memcpy(g_hookPoint + 1, &rel, 4);
     for (size_t i = 5; i < g_savedLen; ++i) g_hookPoint[i] = 0x90; // nop
+#endif
 
     __builtin___clear_cache((char*)g_hookPoint, (char*)g_hookPoint + g_savedLen);
     LOG("[GamesPlayed] Inline detour installed at %p -> trampoline %p", g_hookPoint, g_trampoline);

@@ -394,11 +394,36 @@ static bool IsWithinSteamclient(uintptr_t ptr, uintptr_t steamBase, size_t steam
 static bool IsLikelyAppCloudEnabledSlot(void** vtable, size_t slotIndex, uintptr_t steamBase, size_t steamSize)
 {
     uintptr_t fn = reinterpret_cast<uintptr_t>(vtable[slotIndex]);
-    if (!IsWithinSteamclient(fn, steamBase, steamSize) || !CanReadMemory(reinterpret_cast<void*>(fn), 30))
+    if (!IsWithinSteamclient(fn, steamBase, steamSize) || !CanReadMemory(reinterpret_cast<void*>(fn), 32))
         return false;
 
     const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
 
+#if defined(__x86_64__)
+    // Pattern C (steamrt64 client): SysV, 4 int args. appId = esi, this = rdi.
+    //   41 57          push r15
+    //   41 89 d7       mov  r15d, edx        ; a3
+    //   41 56          push r14
+    //   49 89 ce       mov  r14, rcx         ; a4
+    //   41 55          push r13
+    //   41 89 f5       mov  r13d, esi        ; appId
+    //   41 54          push r12
+    //   55             push rbp
+    //   48 89 fd       mov  rbp, rdi         ; this
+    //   53             push rbx
+    //   48 83 ec ??    sub  rsp, imm8
+    //   85 f6          test esi, esi         ; appId null check
+    //   0f 84          jz   near
+    if (p[0] == 0x41 && p[1] == 0x57 && p[2] == 0x41 && p[3] == 0x89 && p[4] == 0xD7 &&
+        p[5] == 0x41 && p[6] == 0x56 && p[7] == 0x49 && p[8] == 0x89 && p[9] == 0xCE &&
+        p[10] == 0x41 && p[11] == 0x55 && p[12] == 0x41 && p[13] == 0x89 && p[14] == 0xF5 &&
+        p[15] == 0x41 && p[16] == 0x54 && p[17] == 0x55 && p[18] == 0x48 && p[19] == 0x89 &&
+        p[20] == 0xFD && p[21] == 0x53 && p[22] == 0x48 && p[23] == 0x83 && p[24] == 0xEC &&
+        p[26] == 0x85 && p[27] == 0xF6 && p[28] == 0x0F && p[29] == 0x84)
+        return true;
+
+    return false;
+#else
     // Pattern A (older builds): args passed via esp offsets
     //   +0:  55 57 56 53 E8 ?? ?? ?? ??  (push ebp/edi/esi/ebx + call PIC thunk)
     //   +9:  81 C3 ?? ?? ?? ??          (add ebx, imm32)
@@ -429,6 +454,7 @@ static bool IsLikelyAppCloudEnabledSlot(void** vtable, size_t slotIndex, uintptr
         return true;
 
     return false;
+#endif
 }
 
 static size_t ResolveCloudEnabledSlot(void** vtable, uintptr_t steamBase, size_t steamSize)
