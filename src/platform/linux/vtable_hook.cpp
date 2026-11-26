@@ -45,7 +45,7 @@ static uintptr_t FindElfBaseBackward(uintptr_t hint)
     return 0;
 }
 
-uintptr_t VtableHook::FindSteamclient(size_t& outSize)
+uintptr_t VtableHook::FindSteamclient(size_t& outSize, bool quiet)
 {
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f)
@@ -89,7 +89,7 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
                   (void*)labeledMin);
         base = labeledMin;
     }
-    else if (base != labeledMin)
+    else if (base != labeledMin && !quiet)
     {
         Log::Info("corrected steamclient.so base from labeled %p to ELF-magic %p (gap=0x%zx)",
                   (void*)labeledMin, (void*)base, labeledMin - base);
@@ -128,6 +128,8 @@ uintptr_t VtableHook::FindSteamclient(size_t& outSize)
     fclose(f);
 
     outSize = labeledMax - base;
+    if (quiet)
+        return base;
     Log::Info("steamclient.so base=%p end=%p size=0x%zx (%d readable, %d writable ranges)", 
               (void*)base, (void*)labeledMax, outSize, g_readableCount, g_writableCount);
     Log::Debug("labeledMin=%p labeledMax=%p scanWindow=[%p, %p]",
@@ -171,6 +173,21 @@ static const uint8_t* FindBytes(const void* needle, size_t needleLen,
     return nullptr;
 }
 
+// A slot holding the raw (unrelocated) value can be the typeinfo's name
+// field in .data.rel.ro -- or the r_addend of the R_*_RELATIVE entry in
+// .rela.dyn that tells ld.so to write that very value there. The table
+// comes first in the image and never changes, so a wait on it never ends
+// (codespace 2026-11-24/26, two boots out of five: "typeinfo at … (vaddr
+// 0x8b098, unrelocated)" was inside .rela.dyn, 30 s of "Relocations
+// pending" and "transport vtable not found"). An Elf64_Rela is
+// {r_offset, r_info, r_addend}: the word before the addend is r_info, and
+// R_X86_64_RELATIVE is 8 (R_386_RELATIVE too, though .rel.dyn carries no
+// addend, so the 32-bit build has no such copy).
+static bool LooksLikeRelocationAddend(const uintptr_t* p, const uintptr_t* rangeStart)
+{
+    return p - 2 >= rangeStart && p[-1] == 8;
+}
+
 // Search steamclient ranges for a pointer value; tries `primary` first,
 // falls back to `fallback` to avoid false positives on small values.
 static const uintptr_t* FindPointerValue(uintptr_t primary, uintptr_t fallback,
@@ -194,8 +211,15 @@ static const uintptr_t* FindPointerValue(uintptr_t primary, uintptr_t fallback,
 
             for (const uintptr_t* p = scanStart; p < scanEnd; p++)
             {
-                if (*p == target)
-                    return p;
+                if (*p != target)
+                    continue;
+                if (pass == 1 && LooksLikeRelocationAddend(p, scanStart))
+                {
+                    Log::Debug("raw value 0x%zx at %p is a relocation addend, skipped",
+                               (size_t)target, (const void*)p);
+                    continue;
+                }
+                return p;
             }
         }
     }
@@ -233,25 +257,40 @@ void** VtableHook::FindTransportVtable(uintptr_t steamBase, size_t steamSize)
     Log::Debug("typeinfo at %p (vaddr 0x%zx, %s)",
                typeinfo, typeinfoAddr - steamBase, relocated ? "relocated" : "unrelocated");
 
-    // Poll until .data.rel.ro relocations are applied
+    // Poll until .data.rel.ro relocations are applied. Not by watching the
+    // raw slot found above: search again for the RELOCATED value, refreshing
+    // the ranges each time (ld.so re-protects .data.rel.ro when it applies
+    // RELRO), so whichever slot ld.so writes is the one found, and a raw
+    // copy that never changes cannot hold the wait (see
+    // LooksLikeRelocationAddend).
     if (!relocated)
     {
         Log::Info("Relocations pending for .data.rel.ro, waiting...");
-        volatile uintptr_t* nameSlot = const_cast<volatile uintptr_t*>(nameField);
         int waitMs = 0;
         const int maxWaitMs = 30000;  // 30 seconds max
-        while (*nameSlot != rttiStrAddr && waitMs < maxWaitMs)
+        const uintptr_t* found = nullptr;
+        while (waitMs < maxWaitMs)
         {
-            usleep(50000);  // 50ms
-            waitMs += 50;
+            usleep(250000);  // 250 ms: a full scan of the image each time
+            waitMs += 250;
+            size_t refreshedSize = 0;
+            if (FindSteamclient(refreshedSize, true) != steamBase || refreshedSize < steamSize)
+                continue;  // the map changed under us; next round
+            found = FindPointerValue(rttiStrAddr, rttiStrAddr, steamBase, steamSize);
+            if (found)
+                break;
         }
-        if (*nameSlot != rttiStrAddr)
+        if (!found)
         {
             Log::Error("Relocations did not complete after %dms (name_ptr=%p, expected %p)",
-                       waitMs, (void*)*nameSlot, (void*)rttiStrAddr);
+                       waitMs, (void*)*nameField, (void*)rttiStrAddr);
             return nullptr;
         }
-        Log::Info("Relocations completed after %dms", waitMs);
+        nameField = found;
+        typeinfo = nameField - 1;
+        typeinfoAddr = reinterpret_cast<uintptr_t>(typeinfo);
+        Log::Info("Relocations completed after %dms (typeinfo at %p, vaddr 0x%zx)",
+                  waitMs, (const void*)typeinfo, (size_t)(typeinfoAddr - steamBase));
     }
 
     // Find vtable: scan for [offset_to_top=0, typeinfo_ptr] header

@@ -23,7 +23,8 @@ namespace VtableHook
 
     // Find steamclient.so in memory via /proc/self/maps.
     // Returns base address, sets size. Returns 0 on failure.
-    uintptr_t FindSteamclient(size_t& outSize);
+    // quiet: no log lines (the relocation wait refreshes the ranges every 250 ms)
+    uintptr_t FindSteamclient(size_t& outSize, bool quiet = false);
 
     // Locate CClientUnifiedServiceTransport vtable via RTTI scan.
     // steamBase/steamSize from FindSteamclient().
